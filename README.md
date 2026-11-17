@@ -46,6 +46,7 @@ pi-wt                        # auto branch pi/YYYYMMDDHHmm-XXXX
 /worktree new [name] # create + activate
 /worktree list       # show + activate
 /worktree use <path|branch>
+/worktree rename [name]  # rename active worktree branch + directory
 /worktree clean      # prune + remove a worktree (asks first)
 /worktree finish [path]  # merge worktree branch back with --no-ff
 /worktree status     # root, cwd, active worktree

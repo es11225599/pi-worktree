@@ -13,7 +13,7 @@
  *      system prompt's working-directory section at the same path, and the
  *      user's own `!cmd` shell runs there too (`user_bash`).
  *      Path rewriting (`tool_call`) stays as fallback/correction.
- *   3. Adds a `/worktree` command family (new | list | use | clean | finish | status).
+ *   3. Adds a `/worktree` command family (new | list | use | rename | clean | finish | status).
  *
  * pi's own process/session cwd still points at the checkout pi was started in
  * (no API to change it) — `bin/pi-wt` launches pi directly inside the worktree
@@ -42,7 +42,7 @@ import {
 } from "./worktree-utils.mjs";
 
 const exec = promisify(execFile);
-const SUBCOMMANDS = ["new", "list", "use", "clean", "finish", "status"] as const;
+const SUBCOMMANDS = ["new", "list", "use", "rename", "clean", "finish", "status"] as const;
 
 // --- in-memory session state -------------------------------------------------
 
@@ -375,6 +375,35 @@ async function cmdUse(ctx: ExtensionCommandContext, rest: string[]): Promise<voi
 	await refreshWorktreeStatus(ctx);
 }
 
+/** Rename the active worktree: branch first, then the directory (`git worktree move`). */
+async function cmdRename(ctx: ExtensionCommandContext, rest: string[]): Promise<void> {
+	const info = await detectRepo(ctx);
+	if (!info) throw new Error("not a git repository");
+	if (!activeWorktree) throw new Error("no active worktree — /worktree list first");
+	const entry = parseWorktreeList(await git(info.root, ["worktree", "list", "--porcelain"])).find(
+		(e) => e.path === activeWorktree,
+	);
+	if (!entry) throw new Error(`active worktree not in git worktree list: ${activeWorktree}`);
+	const raw = rest.join(" ").trim() || ((await ctx.ui.input("Rename worktree to:", worktreeName(entry.path))) ?? "");
+	const name = sanitizeBranchName(raw);
+	if (!name) return;
+	const newPath = worktreePathFor(info.root, name, process.env.PI_WORKTREE_BASE || ".worktrees");
+	if (name === entry.branch && newPath === entry.path) return;
+	if (entry.branch && entry.branch !== name) await git(entry.path, ["branch", "-m", name]);
+	if (newPath !== entry.path) {
+		try {
+			await git(info.root, ["worktree", "move", entry.path, newPath]);
+		} catch (e) {
+			// branch is already renamed — keep the session usable on the old path
+			await refreshWorktreeStatus(ctx);
+			throw new Error(`branch renamed to ${name}, but moving the directory failed: ${gitError(e)}`);
+		}
+	}
+	await activateWorktree(newPath);
+	ctx.ui.notify(`Renamed → ${newPath} (branch ${name})`, "info");
+	await refreshWorktreeStatus(ctx);
+}
+
 async function cmdClean(ctx: ExtensionCommandContext): Promise<void> {
 	const info = await detectRepo(ctx);
 	if (!info) throw new Error("not a git repository");
@@ -452,6 +481,8 @@ async function runSubcommand(ctx: ExtensionCommandContext, sub: string, rest: st
 			return cmdList(ctx);
 		case "use":
 			return cmdUse(ctx, rest);
+		case "rename":
+			return cmdRename(ctx, rest);
 		case "clean":
 			return cmdClean(ctx);
 		case "finish":
@@ -468,7 +499,7 @@ async function runSubcommand(ctx: ExtensionCommandContext, sub: string, rest: st
 export default function (pi: ExtensionAPI) {
 	runtime = pi;
 	pi.registerCommand("worktree", {
-		description: "Isolated git worktrees: new | list | use | clean | finish | status",
+		description: "Isolated git worktrees: new | list | use | rename | clean | finish | status",
 		getArgumentCompletions(prefix: string) {
 			const items = SUBCOMMANDS.map((s) => ({ value: s, label: s }));
 			const filtered = items.filter((i) => i.value.startsWith(prefix));
@@ -485,6 +516,7 @@ export default function (pi: ExtensionAPI) {
 							{ value: "new", label: "New worktree…", description: "Create + activate" },
 							{ value: "list", label: "List…", description: "Show + activate" },
 							{ value: "status", label: "Status", description: "Show repo + active worktree" },
+							{ value: "rename", label: "Rename…", description: "Rename active worktree branch + dir" },
 							{ value: "clean", label: "Clean…", description: "Remove a worktree" },
 							{ value: "finish", label: "Finish…", description: "Merge branch back" },
 						],
