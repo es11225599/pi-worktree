@@ -7,8 +7,6 @@ One isolated git worktree per pi session — run many pi sessions in the same re
 > 1. **`pi-wt` launcher (true isolation)** — creates `.worktrees/<branch>` *first*, then launches `pi` with cwd inside it. The whole session, including shell defaults, starts in the worktree.
 > 2. **Extension guard (transparent fallback)** — if you start `pi` in the main checkout, the extension auto-creates a worktree on `session_start` and rewrites `read`/`write`/`edit` paths + prefixes `bash` with `cd <worktree>`, so the agent still works in the worktree. The footer shows `wt:<name>`.
 
-Modeled on [`pi-git-context`](https://github.com/es11225599/pi-git-context) (same `extensions/` + dependency-free `.mjs` + `node --test` layout) and [`pi-9router`](https://github.com/es11225599/pi-9router) (same `package.json` `pi.extensions` manifest style).
-
 ## Install
 
 ```bash
