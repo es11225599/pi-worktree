@@ -1,6 +1,7 @@
 /**
  * Smoke test: load the worktree extension with a mock pi object + real temp git repo.
- * Verifies session_start auto-creates a worktree and tool_call rewrites into it.
+ * Verifies session_start auto-creates a worktree, tool_call rewrites into it, and that
+ * bindToolsToCwd re-registers pi's tools with the worktree as the per-call cwd.
  *
  * Run: node --import jiti/register scripts/test-extension-load.ts
  */
@@ -8,7 +9,7 @@ import { execFileSync, execSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import extension from "../extensions/worktree.ts";
+import extension, { bindToolsToCwd } from "../extensions/worktree.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const handlers: Record<string, Array<(event: any, ctx: any) => Promise<any>>> = {};
@@ -59,6 +60,56 @@ async function main() {
 	assert(commands["worktree"] !== undefined, "registers /worktree command");
 	assert((handlers["session_start"]?.length ?? 0) > 0, "subscribes session_start");
 	assert((handlers["tool_call"]?.length ?? 0) > 0, "subscribes tool_call");
+	assert((handlers["before_agent_start"]?.length ?? 0) > 0, "subscribes before_agent_start (prompt cwd)");
+	assert((handlers["user_bash"]?.length ?? 0) > 0, "subscribes user_bash");
+
+	// --- tool binding: what actually moves the agent's cwd -------------------
+	const registered: any[] = [];
+	const bindPi = {
+		getActiveTools: () => ["read", "bash", "edit", "write"],
+		getAllTools: () => [{ name: "read" }, { name: "grep" }],
+		getSettings: () => ({
+			images: { autoResize: false },
+			shellCommandPrefix: "source ~/.profile;",
+			shellPath: "/bin/zsh",
+		}),
+		registerTool: (def: any) => void registered.push(def),
+	} as unknown as ExtensionAPI;
+
+	const stubFactory = (name: string) => (cwd: string, options?: any) => ({
+		name,
+		label: name,
+		description: "stub",
+		parameters: {},
+		execute: async (_id: string, params: any, _s: any, _u: any, tctx: any) => ({
+			content: [
+				{
+					type: "text",
+					text: `${tctx.cwd}|${params.path ?? ""}|${options?.autoResizeImages}|${tctx.extra}`,
+				},
+			],
+		}),
+	});
+
+	const boundNames = await bindToolsToCwd(bindPi, "/tmp/wt-bound", {
+		read: stubFactory("read"),
+		grep: stubFactory("grep"),
+	});
+	assert(boundNames.join(",") === "read,grep", `binds configured builtins (got ${boundNames.join(",")})`);
+	assert(registered.length === 2, `re-registers each name once (got ${registered.length})`);
+	const readDef = registered.find((d) => d.name === "read");
+	const grepDef = registered.find((d) => d.name === "grep");
+	assert(readDef?.defaultActive === true, "active tool stays active");
+	assert(grepDef?.defaultActive === false, "inactive tool is registered without joining the loadout");
+	const res: any = await readDef.execute("1", { path: "a.txt" }, undefined, undefined, {
+		cwd: "/orig-repo",
+		extra: 42,
+	});
+	assert(
+		res.content[0].text === "/tmp/wt-bound|a.txt|false|42",
+		`bound tool sees the worktree as cwd, keeps other ctx fields, mirrors session settings (got ${res.content[0].text})`,
+	);
+	assert((await bindToolsToCwd(bindPi, "/tmp/wt-bound", { read: stubFactory("read") })).length === 0, "rebinding the same cwd is a no-op");
 
 	process.env.PI_WORKTREE_AUTO = "1";
 	for (const fn of handlers["session_start"]) await fn({ reason: "startup" }, ctx);
@@ -94,6 +145,20 @@ async function main() {
 	assert(
 		dirname(String(relEvent.input.path)) === dirname(String(writeEvent.input.path)),
 		`relative path resolves inside the worktree (got ${relEvent.input.path})`,
+	);
+
+	const grepEvent: any = { toolName: "grep", input: { pattern: "x", path: "a.txt" } };
+	await toolCall(grepEvent, ctx);
+	assert(
+		dirname(String(grepEvent.input.path)) === dirname(String(writeEvent.input.path)),
+		`grep paths resolve into the worktree too (got ${grepEvent.input.path})`,
+	);
+
+	const promptEvent: any = { systemPromptOptions: { cwd: tmp } };
+	await handlers["before_agent_start"][0](promptEvent, ctx);
+	assert(
+		String(promptEvent.systemPromptOptions.cwd).includes(".worktrees"),
+		`system prompt cwd points at the worktree (got ${promptEvent.systemPromptOptions.cwd})`,
 	);
 
 	console.log("session_start + tool_call rewrite: OK");

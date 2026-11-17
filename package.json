@@ -1,6 +1,6 @@
 {
   "name": "pi-worktree",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pi package that isolates each pi session in its own git worktree so multiple sessions can develop in the same repo without stepping on each other",
   "keywords": [
     "pi-package",
