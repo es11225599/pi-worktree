@@ -5,14 +5,19 @@
  * Instead this extension:
  *   1. On `session_start`, detects the repo and (unless already isolated)
  *      creates `.worktrees/<branch>` and makes it the *tool target*.
- *   2. Rewrites `read`/`write`/`edit` paths and prefixes `bash` commands so
- *      the agent transparently works inside the worktree even though pi's
- *      visible cwd still points at the original checkout.
+ *   2. Re-registers pi's own tool definitions (`read`, `bash`, `edit`, `write`,
+ *      `grep`, `find`, `ls`) bound to that directory. pi resolves relative paths
+ *      from the per-call `ctx.cwd`, so each definition is wrapped to report the
+ *      worktree — the agent then really works in the worktree, instead of only
+ *      getting `cd <wt> &&` prefixed commands. `before_agent_start` points the
+ *      system prompt's working-directory section at the same path, and the
+ *      user's own `!cmd` shell runs there too (`user_bash`).
+ *      Path rewriting (`tool_call`) stays as fallback/correction.
  *   3. Adds a `/worktree` command family (new | list | use | clean | finish | status).
  *
- * Pair with `bin/pi-wt` (true isolation: the wrapper creates the worktree
- * FIRST and launches `pi` with cwd inside it) when you want the whole
- * session — including shell tool defaults — to start in the worktree.
+ * pi's own process/session cwd still points at the checkout pi was started in
+ * (no API to change it) — `bin/pi-wt` launches pi directly inside the worktree
+ * when you want the process cwd too.
  *
  * Env knobs:
  *   PI_WORKTREE_OFF=1      disable everything
@@ -43,6 +48,7 @@ const SUBCOMMANDS = ["new", "list", "use", "clean", "finish", "status"] as const
 
 let activeWorktree: string | undefined;
 let repoRootCache: string | undefined;
+let runtime: ExtensionAPI | undefined;
 
 // --- git plumbing ------------------------------------------------------------
 
@@ -143,7 +149,111 @@ async function refreshWorktreeStatus(ctx: { cwd: string; ui?: any }): Promise<vo
 	}
 }
 
-// --- path rewriting (the core isolation) -------------------------------------
+// --- tool binding (the core isolation) ----------------------------------------
+//
+// `ctx.cwd` is read-only for extensions, and pi's built-in tools resolve relative
+// paths from the per-call ctx (`resolveReadPathAsync(path, ctx?.cwd || cwd)` in
+// dist/core/tools/read.js), so the factory `cwd` alone does nothing. What moves the
+// agent is re-registering the same definitions with an `execute` that shadows
+// `ctx.cwd` with the worktree. Path rewriting below stays as the fallback for
+// absolute paths that point into the original checkout.
+
+type ToolFactory = (cwd: string, options?: any) => any;
+
+/** pi's own tool factories — re-registering them keeps descriptions/renderers exact. */
+const TOOL_FACTORY_EXPORTS: Record<string, string> = {
+	read: "createReadToolDefinition",
+	bash: "createBashToolDefinition",
+	powershell: "createPowerShellToolDefinition",
+	edit: "createEditToolDefinition",
+	write: "createWriteToolDefinition",
+	grep: "createGrepToolDefinition",
+	find: "createFindToolDefinition",
+	ls: "createLsToolDefinition",
+};
+
+let piModule: Promise<any> | undefined;
+let boundCwd: string | undefined;
+
+/** Load pi lazily so a renamed/absent export degrades to path rewriting instead of breaking the extension. */
+function loadPiModule(): Promise<any> {
+	piModule ??= import("@earendil-works/pi-coding-agent").catch(() => null);
+	return piModule;
+}
+
+async function loadToolFactories(): Promise<Record<string, ToolFactory> | null> {
+	const mod = await loadPiModule();
+	if (!mod) return null;
+	const out: Record<string, ToolFactory> = {};
+	for (const [name, exportName] of Object.entries(TOOL_FACTORY_EXPORTS)) {
+		if (typeof mod[exportName] === "function") out[name] = mod[exportName] as ToolFactory;
+	}
+	return Object.keys(out).length ? out : null;
+}
+
+/** Same tool, but every call sees `cwd` as its working directory. */
+export function withCwd<T extends { execute: (...args: any[]) => any }>(def: T, cwd: string): T {
+	return {
+		...def,
+		execute: (toolCallId: string, params: any, signal: any, onUpdate: any, ctx: any) =>
+			def.execute(
+				toolCallId,
+				params,
+				signal,
+				onUpdate,
+				Object.create(ctx ?? {}, { cwd: { value: cwd, enumerable: true, configurable: true } }),
+			),
+	} as T;
+}
+
+/**
+ * Re-register the configured built-in tools bound to `cwd`. Returns the bound names.
+ * Tools that are not currently active are registered with `defaultActive: false`, so a
+ * session's tool loadout never changes just because isolation kicked in.
+ * Mirrors the options pi builds its own definitions with (image resize, shell prefix/path).
+ */
+export async function bindToolsToCwd(
+	pi: ExtensionAPI,
+	cwd: string,
+	injected?: Record<string, ToolFactory>,
+): Promise<string[]> {
+	if (boundCwd === cwd) return [];
+	const factories = injected ?? (await loadToolFactories());
+	if (!factories) return [];
+	const active = new Set(pi.getActiveTools?.() ?? []);
+	const configured = (pi.getAllTools?.() ?? []).map((tool) => tool.name);
+	const names = (configured.length ? configured : [...active]).filter((name) => factories[name]);
+	if (!names.length) return []; // nothing declared — leave the loadout alone
+	const settings = (pi.getSettings?.() ?? {}) as Record<string, any>;
+	const options: Record<string, any> = {
+		read: { autoResizeImages: settings.images?.autoResize ?? true },
+		bash: { commandPrefix: settings.shellCommandPrefix, shellPath: settings.shellPath },
+	};
+	const bound: string[] = [];
+	for (const name of names) {
+		try {
+			const boundDef = withCwd(factories[name](cwd, options[name]), cwd);
+			pi.registerTool({ ...boundDef, defaultActive: active.has(name) });
+			bound.push(name);
+		} catch {
+			// older pi may refuse to re-register a built-in name — keep the rewrite fallback
+		}
+	}
+	if (bound.length) boundCwd = cwd;
+	return bound;
+}
+
+/** Activate `cwd` (or none) and rebind the tools that point at it. Returns the bound tool names. */
+async function activateWorktree(cwd: string | undefined): Promise<string[]> {
+	activeWorktree = cwd;
+	if (!runtime || !cwd) return [];
+	return bindToolsToCwd(runtime, cwd).catch(() => []);
+}
+
+// --- path rewriting (fallback) ------------------------------------------------
+
+/** Tools whose path argument should be resolved into the worktree. */
+const FILE_TOOLS = new Set(["read", "write", "edit", "grep", "find", "ls"]);
 
 const norm = (p: string) => p.replace(/\\/g, "/");
 const isAbs = (p: string) => /^([A-Za-z]:)?\//.test(norm(p));
@@ -226,8 +336,8 @@ async function cmdNew(ctx: ExtensionCommandContext, nameArg: string): Promise<vo
 	name = sanitizeBranchName(name);
 	if (!name) return;
 	const { path, branch } = await createWorktree(info.root, name);
-	activeWorktree = path;
-	ctx.ui.notify(`Worktree ready: ${path} (branch ${branch}) — agent file ops now target it`, "info");
+	await activateWorktree(path);
+	ctx.ui.notify(`Worktree ready: ${path} (branch ${branch}) — agent tools now run there`, "info");
 	await refreshWorktreeStatus(ctx);
 }
 
@@ -244,13 +354,12 @@ async function cmdList(ctx: ExtensionCommandContext): Promise<void> {
 		value: e.path,
 		label: `${e.path} · ${e.detached ? "detached" : e.branch || "bare"}`,
 	}));
-	await selectDialog(ctx, "Worktrees", items, "Enter to activate · Esc to exit").then((pick) => {
-		if (pick) {
-			activeWorktree = pick;
-			ctx.ui.notify(`Active worktree → ${pick}`, "info");
-			void refreshWorktreeStatus(ctx);
-		}
-	});
+	const pick = await selectDialog(ctx, "Worktrees", items, "Enter to activate · Esc to exit");
+	if (pick) {
+		await activateWorktree(pick);
+		ctx.ui.notify(`Active worktree → ${pick}`, "info");
+		await refreshWorktreeStatus(ctx);
+	}
 }
 
 async function cmdUse(ctx: ExtensionCommandContext, rest: string[]): Promise<void> {
@@ -261,7 +370,7 @@ async function cmdUse(ctx: ExtensionCommandContext, rest: string[]): Promise<voi
 	const entries = parseWorktreeList(porcelain);
 	const hit = entries.find((e) => e.path === want || e.branch === want || e.path.endsWith(want));
 	if (!hit) throw new Error(`no such worktree: ${want || "(empty)"}`);
-	activeWorktree = hit.path;
+	await activateWorktree(hit.path);
 	ctx.ui.notify(`Active worktree → ${hit.path}`, "info");
 	await refreshWorktreeStatus(ctx);
 }
@@ -285,7 +394,11 @@ async function cmdClean(ctx: ExtensionCommandContext): Promise<void> {
 	const ok = await ctx.ui.confirm(`Remove ${pick}?`, "The worktree directory will be deleted. Uncommitted work is lost.");
 	if (!ok) return;
 	await git(info.root, ["worktree", "remove", "--force", pick]);
-	if (activeWorktree === pick) activeWorktree = undefined;
+	if (activeWorktree === pick) {
+		// the bound directory is gone — put the tools back on the session cwd
+		activeWorktree = undefined;
+		if (runtime) await bindToolsToCwd(runtime, ctx.cwd).catch(() => []);
+	}
 	ctx.ui.notify(`Removed ${pick}`, "info");
 	await refreshWorktreeStatus(ctx);
 }
@@ -317,12 +430,14 @@ async function cmdStatus(ctx: ExtensionCommandContext): Promise<void> {
 	}
 	const linked = isLinkedWorktree(info.gitDir, info.gitCommon);
 	repoRootCache = info.root;
+	const toolsAt = boundCwd ? (boundCwd === activeWorktree ? `${boundCwd} ✓` : boundCwd) : "(not bound — path rewriting only)";
 	ctx.ui.notify(
 		[
 			`root: ${info.root}`,
-			`here: ${ctx.cwd}${linked ? " (already an isolated worktree ✓)" : ""}`,
+			`session cwd: ${ctx.cwd}${linked ? " (already an isolated worktree ✓)" : ""}`,
 			`active worktree: ${activeWorktree ?? "(none — agent uses session cwd)"}`,
-			` TIP: run pi via bin/pi-wt for true cwd isolation.`,
+			`agent tools: ${toolsAt}`,
+			` TIP: run pi via bin/pi-wt to give pi's own process cwd the worktree.`,
 		].join("\n"),
 		"info",
 	);
@@ -351,6 +466,7 @@ async function runSubcommand(ctx: ExtensionCommandContext, sub: string, rest: st
 // --- extension entry ------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	runtime = pi;
 	pi.registerCommand("worktree", {
 		description: "Isolated git worktrees: new | list | use | clean | finish | status",
 		getArgumentCompletions(prefix: string) {
@@ -397,8 +513,8 @@ export default function (pi: ExtensionAPI) {
 			if (!info) return; // not a repo — stay silent
 			repoRootCache = info.root;
 			if (isLinkedWorktree(info.gitDir, info.gitCommon)) {
-				// Already isolated (e.g. launched via pi-wt) — just track it.
-				activeWorktree = ctx.cwd;
+				// Already isolated (e.g. launched via pi-wt) — tools already start here.
+				await activateWorktree(ctx.cwd);
 				await refreshWorktreeStatus(ctx as any);
 				return;
 			}
@@ -409,10 +525,13 @@ export default function (pi: ExtensionAPI) {
 			const branch = defaultBranchName();
 			try {
 				const { path } = await createWorktree(info.root, branch);
-				activeWorktree = path;
+				const bound = await activateWorktree(path);
 				if ((ctx as any).hasUI) {
 					(ctx as any).ui.notify(
-						`Isolated workspace ready: ${path}\nAll read/write/edit + bash now target it. See /worktree status.`,
+						`Isolated workspace ready: ${path}\n` +
+							(bound.length
+								? `Tools bound there: ${bound.join(", ")}. See /worktree status.`
+								: "Tools not bound (this pi build) — using path rewriting. See /worktree status."),
 						"info",
 					);
 				}
@@ -425,10 +544,46 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// Transparently retarget file + shell tools into the active worktree.
-	// pi's `tool_call` contract: mutate `event.input` in place; return values are
-	// only for blocking (`{ block, reason, terminate }`). Returning a new input
-	// object is ignored — that silently disabled isolation before.
+	// Point the working-directory section of the system prompt at the worktree: that is
+	// where the tools (and therefore the model's relative paths) live, not pi's own cwd.
+	pi.on("before_agent_start", async (event: any) => {
+		try {
+			if (!activeWorktree || process.env.PI_WORKTREE_OFF === "1") return undefined;
+			const options = event?.systemPromptOptions;
+			if (options && options.cwd !== activeWorktree) options.cwd = activeWorktree;
+			return undefined;
+		} catch {
+			return undefined;
+		}
+	});
+
+	// The user's own `!cmd` shell commands (`user_bash`) run in the worktree too, so the
+	// footer status is not a lie about what the session is touching.
+	pi.on("user_bash", async (event: any) => {
+		try {
+			const wt = activeWorktree;
+			if (!wt || process.env.PI_WORKTREE_OFF === "1") return undefined;
+			if (event?.cwd === wt) return undefined;
+			const mod = await loadPiModule();
+			const createOps = mod?.createLocalBashOperations;
+			if (typeof createOps !== "function") return undefined;
+			const settings = (pi.getSettings?.() ?? {}) as Record<string, any>;
+			const ops = createOps({ shellPath: settings.shellPath });
+			return {
+				operations: {
+					exec: (command: string, _cwd: string, options: any) => ops.exec(command, wt, options),
+				},
+			};
+		} catch {
+			return undefined;
+		}
+	});
+
+	// Fallback/correction layer. pi's `tool_call` contract: mutate `event.input` in place;
+	// return values are only for blocking (`{ block, reason, terminate }`). Returning a
+	// new input object is ignored — that silently disabled isolation before.
+	// With the tools bound above, relative paths already resolve inside the worktree;
+	// this still matters for absolute paths that point into the original checkout.
 	pi.on("tool_call", async (event: any, ctx: any) => {
 		try {
 			if (!activeWorktree || process.env.PI_WORKTREE_OFF === "1") return undefined;
@@ -436,12 +591,14 @@ export default function (pi: ExtensionAPI) {
 			const input = event?.input;
 			if (!root || !input) return undefined;
 			const name = event.toolName as string;
-			if ((name === "read" || name === "write" || name === "edit") && input.path) {
-				input.path = toWorktreePath(input.path as string, ctx.cwd, root, activeWorktree);
+			if (FILE_TOOLS.has(name) && typeof input.path === "string") {
+				const rewritten = toWorktreePath(input.path, ctx.cwd, root, activeWorktree);
+				if (rewritten !== input.path) input.path = rewritten;
 				return undefined;
 			}
 			if (name === "bash" && typeof input.command === "string") {
-				input.command = prefixBash(input.command, activeWorktree);
+				// bound tools already start in the worktree — no `cd` prefix needed
+				if (boundCwd !== activeWorktree) input.command = prefixBash(input.command, activeWorktree);
 				if (typeof input.cwd === "string") input.cwd = activeWorktree;
 				return undefined;
 			}
