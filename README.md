@@ -64,7 +64,7 @@ pi-wt                        # auto branch pi/YYYYMMDDHHmm-XXXX
 
 - `session_start`: `git rev-parse --show-toplevel / --git-dir / --git-common-dir`. `gitDir !== gitCommonDir` ⇒ already isolated, track `ctx.cwd`. Else `git worktree add .worktrees/<branch> -b <branch>` (falls back to attach when the branch exists). Ensures `.worktrees/` is git-ignored (appends `.gitignore`, never commits for you).
 - `tool_call`: `read`/`write`/`edit` relative-or-in-repo paths are rewritten under the active worktree; `bash.command` is prefixed `cd "<wt>" && …` (skipped when already referencing it). Nothing else is touched.
-- Footer: `wt:<leaf> · N changed`, refreshed on session start and after every subcommand.
+- Footer: `wt:on · <leaf> · N changed` inside a worktree, `wt:off · <branch>` outside one, refreshed on session start and after every subcommand.
 
 ## Merge back
 

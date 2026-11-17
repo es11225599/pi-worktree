@@ -24,7 +24,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { appendFile, readFile } from "node:fs/promises";
-import { join, relative, sep } from "node:path";
+import { join, relative } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Container, DynamicBorder, SelectList, Text, type SelectItem } from "@earendil-works/pi-tui";
 import {
@@ -32,6 +32,7 @@ import {
 	isLinkedWorktree,
 	parseWorktreeList,
 	sanitizeBranchName,
+	worktreeName,
 	worktreePathFor,
 } from "./worktree-utils.mjs";
 
@@ -123,8 +124,8 @@ async function refreshWorktreeStatus(ctx: { cwd: string; ui?: any }): Promise<vo
 			} catch {
 				dirty = "?";
 			}
-			const short = activeWorktree.split(sep).slice(-2).join(sep);
-			ctx.ui?.setStatus?.("worktree", `wt:${short} · ${dirty} changed`);
+			const name = worktreeName(activeWorktree) || "(unnamed)";
+			ctx.ui?.setStatus?.("worktree", `wt:on · ${name} · ${dirty} changed`);
 			return;
 		}
 		const info = await detectRepo(ctx);
@@ -133,9 +134,9 @@ async function refreshWorktreeStatus(ctx: { cwd: string; ui?: any }): Promise<vo
 			return;
 		}
 		if (isLinkedWorktree(info.gitDir, info.gitCommon)) {
-			ctx.ui?.setStatus?.("worktree", `wt:${info.branch || "detached"}`);
+			ctx.ui?.setStatus?.("worktree", `wt:on · ${worktreeName(info.root) || info.branch || "detached"}`);
 		} else {
-			ctx.ui?.setStatus?.("worktree", `${info.branch || "?"}`);
+			ctx.ui?.setStatus?.("worktree", `wt:off · ${info.branch || "?"}`);
 		}
 	} catch {
 		ctx.ui?.setStatus?.("worktree", undefined);
@@ -146,12 +147,22 @@ async function refreshWorktreeStatus(ctx: { cwd: string; ui?: any }): Promise<vo
 
 const norm = (p: string) => p.replace(/\\/g, "/");
 const isAbs = (p: string) => /^([A-Za-z]:)?\//.test(norm(p));
+const isWinPath = (p: string) => /^[A-Za-z]:\//.test(norm(p));
+
+/** True when `p` is `dir` itself or inside it (boundary-aware, case-insensitive on Windows). */
+function isInside(p: string, dir: string): boolean {
+	let a = norm(p);
+	let b = norm(dir).replace(/\/+$/, "");
+	if (isWinPath(b)) {
+		a = a.toLowerCase();
+		b = b.toLowerCase();
+	}
+	return a === b || a.startsWith(b + "/");
+}
 
 function toWorktreePath(p: string, ctxCwd: string, root: string, wt: string): string {
 	if (!p) return p;
-	const np = norm(p);
-	const nwt = norm(wt);
-	if (np.startsWith(nwt)) return p; // already inside (sep-normalized compare)
+	if (isInside(p, wt)) return p; // already inside the worktree — don't double-rewrite
 	if (isAbs(p)) {
 		// absolute path inside the original repo → mirror into worktree
 		const rel = relative(root, p);
@@ -415,23 +426,23 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// Transparently retarget file + shell tools into the active worktree.
+	// pi's `tool_call` contract: mutate `event.input` in place; return values are
+	// only for blocking (`{ block, reason, terminate }`). Returning a new input
+	// object is ignored — that silently disabled isolation before.
 	pi.on("tool_call", async (event: any, ctx: any) => {
 		try {
 			if (!activeWorktree || process.env.PI_WORKTREE_OFF === "1") return undefined;
 			const root = repoRootCache ?? ctx?.cwd;
-			if (!root) return undefined;
+			const input = event?.input;
+			if (!root || !input) return undefined;
 			const name = event.toolName as string;
-			if ((name === "read" || name === "write" || name === "edit") && event.input?.path) {
-				const orig = event.input.path as string;
-				const next = toWorktreePath(orig, ctx.cwd, root, activeWorktree);
-				if (next !== orig) return { input: { ...event.input, path: next } };
+			if ((name === "read" || name === "write" || name === "edit") && input.path) {
+				input.path = toWorktreePath(input.path as string, ctx.cwd, root, activeWorktree);
 				return undefined;
 			}
-			if (name === "bash" && typeof event.input?.command === "string") {
-				const nextCmd = prefixBash(event.input.command, activeWorktree);
-				const nextInput = { ...event.input, command: nextCmd };
-				if (typeof event.input.cwd === "string") nextInput.cwd = activeWorktree;
-				if (nextCmd !== event.input.command) return { input: nextInput };
+			if (name === "bash" && typeof input.command === "string") {
+				input.command = prefixBash(input.command, activeWorktree);
+				if (typeof input.cwd === "string") input.cwd = activeWorktree;
 				return undefined;
 			}
 			return undefined;

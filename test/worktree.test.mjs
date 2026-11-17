@@ -6,6 +6,7 @@ import {
 	worktreePathFor,
 	parseWorktreeList,
 	isLinkedWorktree,
+	worktreeName,
 } from "../extensions/worktree-utils.mjs";
 
 test("sanitizeBranchName strips illegal ref chars", () => {
@@ -63,4 +64,22 @@ test("isLinkedWorktree compares normalized dirs", () => {
 		true,
 	);
 	assert.equal(isLinkedWorktree("", ""), false);
+});
+
+test("worktreeName is the leaf name on every platform", () => {
+	// POSIX (Linux / macOS)
+	assert.equal(worktreeName("/home/u/repo/.worktrees/pi-1"), "pi-1");
+	assert.equal(worktreeName("/Users/u/repo/.worktrees/feature-foo"), "feature-foo");
+	assert.equal(worktreeName("/repo/.worktrees/pi-1/"), "pi-1");
+	// Windows (git prints /, but \\ can arrive from the OS)
+	assert.equal(worktreeName("E:/Open Source Projects/pi-worktree/.worktrees/pi-202611171638-1918"), "pi-202611171638-1918");
+	assert.equal(worktreeName("E:\\repo\\.worktrees\\pi-1"), "pi-1");
+	assert.equal(worktreeName("E:\\repo\\.worktrees\\pi-1\\"), "pi-1");
+	// mixed separators + edge cases
+	assert.equal(worktreeName("E:/repo\\sub/pi-2"), "pi-2");
+	assert.equal(worktreeName("pi-plain"), "pi-plain");
+	assert.equal(worktreeName(""), "");
+	assert.equal(worktreeName("/"), "");
+	assert.equal(worktreeName("E:/"), "");
+	assert.equal(worktreeName(undefined), "");
 });

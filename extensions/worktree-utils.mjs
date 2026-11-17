@@ -78,3 +78,18 @@ export function isLinkedWorktree(gitDir, gitCommonDir) {
 	const norm = (p) => p.replace(/\\/g, "/").replace(/\/+$/, "");
 	return norm(gitDir) !== norm(gitCommonDir);
 }
+
+/**
+ * Leaf name of a worktree path, independent of the running platform.
+ * git prints `/` on every OS, but Windows paths may arrive with `\`, so both
+ * separators are accepted. Returns "" for empty input and drive/root paths.
+ *   "/repo/.worktrees/pi-1"            -> "pi-1"
+ *   "E:/repo/.worktrees/pi-1"         -> "pi-1"
+ *   "E:\\repo\\.worktrees\\pi-1\\"      -> "pi-1"
+ */
+export function worktreeName(path) {
+	if (typeof path !== "string" || !path.trim()) return "";
+	const parts = path.replace(/\\/g, "/").replace(/\/+$/, "").split("/").filter(Boolean);
+	if (parts.length === 1 && /^[A-Za-z]:$/.test(parts[0])) return ""; // drive root
+	return parts[parts.length - 1] || "";
+}

@@ -7,7 +7,7 @@
 import { execFileSync, execSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import extension from "../extensions/worktree.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -65,13 +65,36 @@ async function main() {
 
 	const toolCall = handlers["tool_call"][0];
 	const r1 = await toolCall({ toolName: "write", input: { path: "foo.txt" } }, ctx);
-	assert(r1?.input?.path?.includes(".worktrees"), `write rewritten into worktree (got ${r1?.input?.path})`);
+	assert(r1 === undefined, "tool_call returns nothing (blocking is the only return contract)");
 
-	const r2 = await toolCall({ toolName: "bash", input: { command: "ls -la" } }, ctx);
-	assert(r2?.input?.command?.startsWith("cd "), `bash prefixed with cd (got ${r2?.input?.command})`);
+	// pi's contract is in-place mutation of event.input — assert the real behavior.
+	const writeEvent: any = { toolName: "write", input: { path: "foo.txt" } };
+	await toolCall(writeEvent, ctx);
+	assert(
+		String(writeEvent.input.path).includes(".worktrees"),
+		`write path mutated into worktree (got ${writeEvent.input.path})`,
+	);
 
-	const r3 = await toolCall({ toolName: "read", input: { path: r1.input.path } }, ctx);
-	assert(r3 === undefined, "paths already inside worktree pass through untouched");
+	const bashEvent: any = { toolName: "bash", input: { command: "ls -la" } };
+	await toolCall(bashEvent, ctx);
+	assert(
+		String(bashEvent.input.command).startsWith("cd "),
+		`bash command mutated with cd (got ${bashEvent.input.command})`,
+	);
+
+	const readEvent: any = { toolName: "read", input: { path: writeEvent.input.path } };
+	await toolCall(readEvent, ctx);
+	assert(
+		readEvent.input.path === writeEvent.input.path,
+		"paths already inside worktree pass through untouched",
+	);
+
+	const relEvent: any = { toolName: "read", input: { path: "a.txt" } };
+	await toolCall(relEvent, ctx);
+	assert(
+		dirname(String(relEvent.input.path)) === dirname(String(writeEvent.input.path)),
+		`relative path resolves inside the worktree (got ${relEvent.input.path})`,
+	);
 
 	console.log("session_start + tool_call rewrite: OK");
 	console.log("sample notifies:", notes.slice(0, 2).join(" | "));
