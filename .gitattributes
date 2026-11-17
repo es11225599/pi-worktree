@@ -1,0 +1,5 @@
+# Normalize line endings; keep the launcher Unix-executable with LF.
+* text=auto
+bin/* text eol=lf
+*.mjs text eol=lf
+*.ts text eol=lf
