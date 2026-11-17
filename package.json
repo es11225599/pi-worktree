@@ -1,0 +1,55 @@
+{
+  "name": "pi-worktree",
+  "version": "0.1.0",
+  "description": "Pi package that isolates each pi session in its own git worktree so multiple sessions can develop in the same repo without stepping on each other",
+  "keywords": [
+    "pi-package",
+    "git",
+    "worktree",
+    "developer-tools"
+  ],
+  "homepage": "https://github.com/es11225599/pi-worktree",
+  "bugs": {
+    "url": "https://github.com/es11225599/pi-worktree/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/es11225599/pi-worktree.git"
+  },
+  "license": "MIT",
+  "author": "es11225599",
+  "type": "module",
+  "files": [
+    "extensions",
+    "bin",
+    "test",
+    "README.md",
+    "package.json"
+  ],
+  "bin": {
+    "pi-wt": "./bin/pi-wt.mjs"
+  },
+  "scripts": {
+    "test": "node test/worktree.test.mjs && node --import jiti/register scripts/test-extension-load.ts",
+    "test:unit": "node test/worktree.test.mjs",
+    "test:extension": "node --import jiti/register scripts/test-extension-load.ts",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "jiti": "^2.0.0",
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  }
+}
